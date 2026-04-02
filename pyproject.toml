@@ -1,13 +1,14 @@
 [project]
-name = "Jachlam"
-version = "0.0.1"
-description = "An AI That Learns with what you Type."
-readme = "README.md"
+name = "discord-python-bot"
+version = "0.1.0"
+description = "Discord economy and Markov bot"
 requires-python = ">=3.12"
 dependencies = [
-    "discord.py>=2.4.0",
-    "python-dotenv>=1.0.1",
+  "discord.py>=2.6.4",
+  "aiofiles>=24.1.0",
+  "python-dotenv>=1.0.1",
 ]
 
-[tool.uv]
-package = false
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
