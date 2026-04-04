@@ -843,68 +843,68 @@ async def force(ctx):
     debug("Force command used")
     await send_phrase_reply(ctx.channel)
 
-
 @bot.command(name="assassinate")
 async def assassinate(ctx, member: discord.Member):
-  if ctx.channel.id != CHANNEL_ID:
-    return
+    if ctx.channel.id != CHANNEL_ID:
+        return
 
-  attacker_id = ctx.author.id
-  is_admin = is_money_admin(attacker_id)
-  target_id = member.id
+    attacker_id = ctx.author.id
+    target_id = member.id
+    is_admin = is_money_admin(attacker_id)
 
-  if attacker_id == target_id:
-    await ctx.send("you can't assassinate yourself. try therapy instead")
-    return
+    if attacker_id == target_id:
+        await ctx.send("you can't assassinate yourself. try therapy instead")
+        return
 
-if not is_admin:
-  can_use, remaining = can_use_assassinate(attacker_id)
-  if not can_use:
-    await ctx.send(f"you can assassinate again in {fmt_seconds(remaining)}")
-    return
-    
-  attacker_balance = get_cash(attacker_id)
+    # Cooldown check (non-admin only)
+    if not is_admin:
+        can_use, remaining = can_use_assassinate(attacker_id)
+        if not can_use:
+            await ctx.send(f"you can assassinate again in {fmt_seconds(remaining)}")
+            return
 
-if not is_admin:
-  if attacker_balance < ASSASSINATE_COST:
-    await ctx.send(f"you need ${ASSASSINATE_COST} to attempt an assassination")
-    return
+    attacker_balance = get_cash(attacker_id)
 
-  await set_cash(attacker_id, attacker_balance - ASSASSINATE_COST, ctx.author)
-  # deduct upfront cost
-  await set_cash(attacker_id, attacker_balance - ASSASSINATE_COST, ctx.author)
+    # Cost check (non-admin only)
+    if not is_admin:
+        if attacker_balance < ASSASSINATE_COST:
+            await ctx.send(f"you need ${ASSASSINATE_COST} to attempt an assassination")
+            return
 
-  success = random.random() < ASSASSINATE_SUCCESS_CHANCE
-  if not is_admin:
-    last_assassinate[attacker_id] = int(time.time())
+        await set_cash(attacker_id, attacker_balance - ASSASSINATE_COST, ctx.author)
 
-  if success:
-    try:
-      await member.timeout(
-        discord.utils.utcnow() + discord.timedelta(seconds=ASSASSINATE_TIMEOUT_SECONDS),
-        reason="Assassinated"
-      )
-      await ctx.send(
-        f"{ctx.author.mention} successfully assassinated {member.mention}. "
-        f"they are gone for 2 hours. balance: ${get_cash(attacker_id)}"
-      )
-    except Exception:
-      await ctx.send(
-        f"assassination succeeded, but I couldn't timeout them (missing perms). great."
-      )
-    return
+    success = random.random() < ASSASSINATE_SUCCESS_CHANCE
 
-if is_admin:
-  await ctx.send("assassination failed. but you're admin, so nothing happens. must be nice.")
-  return
+    if not is_admin:
+        last_assassinate[attacker_id] = int(time.time())
 
-penalty = min(ASSASSINATE_FAIL_PENALTY, get_cash(attacker_id))
-await set_cash(attacker_id, get_cash(attacker_id) - penalty, ctx.author)
+    if success:
+        try:
+            await member.timeout(
+                discord.utils.utcnow() + discord.timedelta(seconds=ASSASSINATE_TIMEOUT_SECONDS),
+                reason="Assassinated"
+            )
+            await ctx.send(
+                f"{ctx.author.mention} successfully assassinated {member.mention}. "
+                f"they are gone for 2 hours. balance: ${get_cash(attacker_id)}"
+            )
+        except Exception:
+            await ctx.send("assassination succeeded, but timeout failed (permissions issue)")
+        return
 
-await ctx.send(
-  f"assassination failed. you paid ${penalty} in penalties. "
-  f"balance: ${get_cash(attacker_id)}"
-)
+    # Failure
+    if is_admin:
+        await ctx.send("assassination failed. but you're admin, so nothing happens. must be nice.")
+        return
+
+    penalty = min(ASSASSINATE_FAIL_PENALTY, get_cash(attacker_id))
+    await set_cash(attacker_id, get_cash(attacker_id) - penalty, ctx.author)
+
+    await ctx.send(
+        f"assassination failed. you paid ${penalty}. balance: ${get_cash(attacker_id)}"
+    )
+
+
 @bot.command()
 async def reset(ctx):
   if ctx.channel.id != CHANNEL_ID:
