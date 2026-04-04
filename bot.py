@@ -8,7 +8,7 @@ import json
 import re
 import time
 from dotenv import load_dotenv
-
+from datetime import timedelta
 # Load environment variables
 load_dotenv()
 
@@ -849,29 +849,26 @@ async def assassinate(ctx, member: discord.Member):
         return
 
     attacker_id = ctx.author.id
-    target_id = member.id
     is_admin = is_money_admin(attacker_id)
 
-    if attacker_id == target_id:
-        await ctx.send("you can't assassinate yourself. try therapy instead")
+    if attacker_id == member.id:
+        await ctx.send("you can't assassinate yourself")
         return
 
-    # Cooldown check (non-admin only)
+    # cooldown
     if not is_admin:
         can_use, remaining = can_use_assassinate(attacker_id)
         if not can_use:
-            await ctx.send(f"you can assassinate again in {fmt_seconds(remaining)}")
+            await ctx.send(f"cooldown: {fmt_seconds(remaining)}")
             return
 
-    attacker_balance = get_cash(attacker_id)
-
-    # Cost check (non-admin only)
+    # cost
     if not is_admin:
-        if attacker_balance < ASSASSINATE_COST:
-            await ctx.send(f"you need ${ASSASSINATE_COST} to attempt an assassination")
+        balance = get_cash(attacker_id)
+        if balance < ASSASSINATE_COST:
+            await ctx.send(f"need ${ASSASSINATE_COST}")
             return
-
-        await set_cash(attacker_id, attacker_balance - ASSASSINATE_COST, ctx.author)
+        await set_cash(attacker_id, balance - ASSASSINATE_COST, ctx.author)
 
     success = random.random() < ASSASSINATE_SUCCESS_CHANCE
 
@@ -880,30 +877,24 @@ async def assassinate(ctx, member: discord.Member):
 
     if success:
         try:
-            await member.timeout(
-                discord.utils.utcnow() + discord.timedelta(seconds=ASSASSINATE_TIMEOUT_SECONDS),
-                reason="Assassinated"
-            )
-            await ctx.send(
-                f"{ctx.author.mention} successfully assassinated {member.mention}. "
-                f"they are gone for 2 hours. balance: ${get_cash(attacker_id)}"
-            )
-        except Exception:
-            await ctx.send("assassination succeeded, but timeout failed (permissions issue)")
+            until = discord.utils.utcnow() + timedelta(seconds=ASSASSINATE_TIMEOUT_SECONDS)
+            await member.timeout(until, reason="assassinated")
+
+            await ctx.send(f"{member.mention} got wiped for 2 hours")
+        except discord.Forbidden:
+            await ctx.send("failed: missing permissions or role too high")
+        except Exception as e:
+            await ctx.send(f"unexpected error: {e}")
         return
 
-    # Failure
     if is_admin:
-        await ctx.send("assassination failed. but you're admin, so nothing happens. must be nice.")
+        await ctx.send("failed but you're admin so who cares")
         return
 
     penalty = min(ASSASSINATE_FAIL_PENALTY, get_cash(attacker_id))
     await set_cash(attacker_id, get_cash(attacker_id) - penalty, ctx.author)
 
-    await ctx.send(
-        f"assassination failed. you paid ${penalty}. balance: ${get_cash(attacker_id)}"
-    )
-
+    await ctx.send(f"failed. lost ${penalty}")
 
 @bot.command()
 async def reset(ctx):
