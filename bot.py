@@ -67,6 +67,12 @@ BOT_GIVE_MAX = 120
 BOT_STEAL_MIN = 20
 BOT_STEAL_MAX = 120
 BOT_MIN_BALANCE_FOR_SOCIAL = 80
+ASSASSINATE_COST = 10000
+ASSASSINATE_SUCCESS_CHANCE = 0.5
+ASSASSINATE_FAIL_PENALTY = 15000
+ASSASSINATE_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hours
+ASSASSINATE_COOLDOWN = 600  # optional: 10 minutes
+last_assassinate = {}
 
 # Progressive tax rate based on current balance.
 TAX_BRACKETS = [
@@ -134,7 +140,9 @@ track_target = None
 
 # ================= HELPERS =================
 
-
+def can_use_assassinate(uid):
+  remaining = get_remaining_cooldown(last_assassinate.get(uid, 0), ASSASSINATE_COOLDOWN)
+  return remaining == 0, remaining
 def is_valid_phrase(text):
   if text.startswith("!"):
     return False
@@ -835,6 +843,59 @@ async def force(ctx):
     debug("Force command used")
     await send_phrase_reply(ctx.channel)
 
+@bot.command(name="assassinate")
+async def assassinate(ctx, member: discord.Member):
+  if ctx.channel.id != CHANNEL_ID:
+    return
+
+  attacker_id = ctx.author.id
+  target_id = member.id
+
+  if attacker_id == target_id:
+    await ctx.send("you can't assassinate yourself. try therapy instead")
+    return
+
+  can_use, remaining = can_use_assassinate(attacker_id)
+  if not can_use:
+    await ctx.send(f"you can assassinate again in {fmt_seconds(remaining)}")
+    return
+
+  attacker_balance = get_cash(attacker_id)
+
+  if attacker_balance < ASSASSINATE_COST:
+    await ctx.send(f"you need ${ASSASSINATE_COST} to attempt an assassination")
+    return
+
+  # deduct upfront cost
+  await set_cash(attacker_id, attacker_balance - ASSASSINATE_COST, ctx.author)
+
+  success = random.random() < ASSASSINATE_SUCCESS_CHANCE
+  last_assassinate[attacker_id] = int(time.time())
+
+  if success:
+    try:
+      await member.timeout(
+        discord.utils.utcnow() + discord.timedelta(seconds=ASSASSINATE_TIMEOUT_SECONDS),
+        reason="Assassinated"
+      )
+      await ctx.send(
+        f"{ctx.author.mention} successfully assassinated {member.mention}. "
+        f"they are gone for 2 hours. balance: ${get_cash(attacker_id)}"
+      )
+    except Exception:
+      await ctx.send(
+        f"assassination succeeded, but I couldn't timeout them (missing perms). great."
+      )
+    return
+
+  # failure case
+  penalty = min(ASSASSINATE_FAIL_PENALTY, get_cash(attacker_id))
+  await set_cash(attacker_id, get_cash(attacker_id) - penalty, ctx.author)
+
+  await ctx.send(
+    f"assassination failed. you paid ${penalty} in penalties. "
+    f"balance: ${get_cash(attacker_id)}"
+  )
 
 @bot.command()
 async def reset(ctx):
