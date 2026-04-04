@@ -209,13 +209,22 @@ def get_debt(uid):
 def is_money_admin(uid):
   return int(uid) == MONEY_ADMIN_USER_ID
 
-
 async def set_cash(uid, amount, member=None):
-  uid = int(uid)
-  user_cash[uid] = max(0, int(amount))
-  if member is not None:
-    await update_cash_nick(member, user_cash[uid])
-  await save_cash_data()
+    uid = int(uid)
+    user_cash[uid] = max(0, int(amount))
+    
+    # Always try to update nickname if member is passed
+    if member is None and bot_user_id == uid:
+        # get bot member from guilds if not explicitly passed
+        for guild in bot.guilds:
+            member = guild.get_member(uid)
+            if member:
+                break
+
+    if member:
+        await update_cash_nick(member, user_cash[uid])
+
+    await save_cash_data()
 
 
 async def load_cash_data():
