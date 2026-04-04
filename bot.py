@@ -842,59 +842,48 @@ async def force(ctx):
   if ctx.channel.id == CHANNEL_ID:
     debug("Force command used")
     await send_phrase_reply(ctx.channel)
-
 @bot.command(name="assassinate")
 async def assassinate(ctx, member: discord.Member):
     if ctx.channel.id != CHANNEL_ID:
         return
 
     attacker_id = ctx.author.id
-    is_admin = is_money_admin(attacker_id)
+    target_id = member.id
 
-    if attacker_id == member.id:
-        await ctx.send("you can't assassinate yourself")
+    if attacker_id == target_id:
+        await ctx.send("You can't assassinate yourself. Try therapy instead.")
         return
 
-    # cooldown
-    if not is_admin:
-        can_use, remaining = can_use_assassinate(attacker_id)
-        if not can_use:
-            await ctx.send(f"cooldown: {fmt_seconds(remaining)}")
-            return
+    can_use, remaining = can_use_assassinate(attacker_id)
+    if not can_use:
+        await ctx.send(f"Assassinate is on cooldown. Try again in {fmt_seconds(remaining)}.")
+        return
 
-    # cost
-    if not is_admin:
-        balance = get_cash(attacker_id)
-        if balance < ASSASSINATE_COST:
-            await ctx.send(f"need ${ASSASSINATE_COST}")
-            return
-        await set_cash(attacker_id, balance - ASSASSINATE_COST, ctx.author)
+    attacker_cash = get_cash(attacker_id)
+    if attacker_cash < ASSASSINATE_COST:
+        await ctx.send(f"You need ${ASSASSINATE_COST} to attempt an assassination. Current cash: ${attacker_cash}")
+        return
+
+    # Deduct the cost
+    await set_cash(attacker_id, attacker_cash - ASSASSINATE_COST, ctx.author)
+    last_assassinate[attacker_id] = int(time.time())
 
     success = random.random() < ASSASSINATE_SUCCESS_CHANCE
-
-    if not is_admin:
-        last_assassinate[attacker_id] = int(time.time())
-
     if success:
-        try:
-            until = discord.utils.utcnow() + timedelta(seconds=ASSASSINATE_TIMEOUT_SECONDS)
-            await member.timeout(until, reason="assassinated")
-
-            await ctx.send(f"{member.mention} got wiped for 2 hours")
-        except discord.Forbidden:
-            await ctx.send("failed: missing permissions or role too high")
-        except Exception as e:
-            await ctx.send(f"unexpected error: {e}")
-        return
-
-    if is_admin:
-        await ctx.send("failed but you're admin so who cares")
-        return
-
-    penalty = min(ASSASSINATE_FAIL_PENALTY, get_cash(attacker_id))
-    await set_cash(attacker_id, get_cash(attacker_id) - penalty, ctx.author)
-
-    await ctx.send(f"failed. lost ${penalty}")
+        # On success, target loses all cash and gains debt
+        target_cash = get_cash(target_id)
+        user_cash[target_id] = 0
+        user_debt[target_id] = get_debt(target_id) + 10000
+        await update_cash_nick(member, 0)
+        await save_cash_data()
+        await ctx.send(f"💀 Assassination succeeded! {member.mention} loses ${target_cash} and gains $10,000 debt.")
+    else:
+        # On fail, attacker loses all cash and gains debt
+        user_cash[attacker_id] = 0
+        user_debt[attacker_id] = get_debt(attacker_id) + 10000
+        await update_cash_nick(ctx.author, 0)
+        await save_cash_data()
+        await ctx.send(f"❌ Assassination failed! {ctx.author.mention} loses all cash and gains $10,000 debt.")
 
 @bot.command()
 async def reset(ctx):
