@@ -55,7 +55,7 @@ DEBT_PENALTY_DEBT_RATE = 0.03
 TAX_INTERVAL_SECONDS = 60 * 60  # 1 hour
 STEAL_SUCCESS_CHANCE = 0.38
 STEAL_FAIL_PENALTY_RATE = 0.25
-BOT_AUTO_ECONOMY_ENABLED = True
+BOT_AUTO_ECONOMY_ENABLED = False
 BOT_AUTO_MIN_DELAY = 180
 BOT_AUTO_MAX_DELAY = 480
 BOT_AUTO_TRIGGER_CHANCE = 0.35
@@ -74,14 +74,8 @@ ASSASSINATE_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hours
 ASSASSINATE_COOLDOWN = 600  # optional: 10 minutes
 last_assassinate = {}
 
-# Progressive tax rate based on current balance.
-TAX_BRACKETS = [
-  (20000, 0.10),
-  (10000, 0.07),
-  (5000, 0.04),
-  (1000, 0.02),
-  (0, 0.00),
-]
+# Flat tax keeps taxes equal for everyone.
+TAX_RATE = 0.03
 
 FALLBACKS = ["dang same", "yo fr", "ehh idk", "😭"]
 
@@ -131,9 +125,6 @@ reaction_starts = []
 reaction_middles = []
 reaction_ends = []
 MAX_REACTIONS = 200
-
-message_counter = 0
-messages_per_reply = random.randint(1, 5)
 
 mode = "global"  # "global" or "track"
 track_target = None
@@ -349,10 +340,7 @@ def fmt_seconds(seconds):
 
 
 def tax_rate_for_balance(balance):
-  for threshold, rate in TAX_BRACKETS:
-    if balance >= threshold:
-      return rate
-  return 0.0
+  return TAX_RATE
 
 
 async def apply_tax_if_due(uid, member=None):
@@ -774,12 +762,11 @@ async def on_ready():
   except Exception as e:
     print(f"Failed to sync commands: {e}")
   bot.loop.create_task(terminal_input_loop())
-  bot.loop.create_task(bot_economy_loop())
+  if BOT_AUTO_ECONOMY_ENABLED:
+    bot.loop.create_task(bot_economy_loop())
 
 @bot.event
 async def on_message(message):
-  global message_counter, messages_per_reply
-
   if message.author.bot or message.channel.id != CHANNEL_ID:
     return
 
@@ -803,7 +790,7 @@ async def on_message(message):
       await set_cash(bot_user_id, get_bot_cash() + taxed)
       bot_stats["tax_collected"] += taxed
     await message.channel.send(
-      f"{message.author.mention} paid ${taxed} tax ({int(rate * 100)}%). new balance: ${get_cash(uid)}"
+      f"{message.author.mention} paid ${taxed} flat tax ({int(rate * 100)}%). new balance: ${get_cash(uid)}"
     )
 
   debug(f"Message from {message.author.display_name}: {content}")
@@ -826,15 +813,6 @@ async def on_message(message):
       await append_corpus_line(uid, content, is_quote=False)
   else:
     debug("Phrase rejected")
-
-  message_counter += 1
-  debug(f"Message counter: {message_counter}/{messages_per_reply}")
-
-  if message_counter >= messages_per_reply:
-    message_counter = 0
-    messages_per_reply = random.randint(1, 5)
-    debug(f"Trigger reply, next in {messages_per_reply}")
-    await send_phrase_reply(message.channel)
 
   await bot.process_commands(message)
 
