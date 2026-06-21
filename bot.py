@@ -805,7 +805,14 @@ async def send_phrase_reply(channel):
     if random.random() < SILENCE_CHANCE:
       debug("Silence roll triggered")
       return
+    # Random chance to use an economy command instead
+    if random.random() < 0.25:  # 25% chance
+        possible_commands = ["!beg", "!work", "!pray", "!gamble all", "!steal <@1388459209431187557>"]
+        chosen = random.choice(possible_commands)
 
+        debug(f"Bot using command: {chosen}")
+        await channel.send(chosen)
+        return
     # In TRACK mode, imitate using full lines from the tracked user only.
     if mode == "track":
       source_pool = user_full_lines.get(track_target, [])[-MAX_RECENT_PHRASES:]
