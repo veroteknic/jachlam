@@ -11,7 +11,7 @@ from collections import deque
 from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
-
+INV_FILE = "inv.json"
 TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN")
 CHANNEL_ID_DEFAULT = 1409844931761279019
 MONEY_ADMIN_USER_ID = 1055064009457537024
@@ -72,6 +72,14 @@ ASSASSINATE_FAIL_PENALTY = 15000
 ASSASSINATE_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hours
 ASSASSINATE_COOLDOWN = 600  # optional: 10 minutes
 last_assassinate = {}
+last_assassinated_at = {}  # {target_id: unix_ts} -- protection window after being hit
+
+# Minimum seconds between nickname edits for the same member (Discord rate-limits
+# nickname changes per guild, so we throttle instead of editing on every cash change).
+NICK_EDIT_MIN_INTERVAL = 20
+last_nick_edit = {}  # {member_id: unix_ts}
+
+ADMIN_USER_IDS = {MONEY_ADMIN_USER_ID}
 
 # Progressive tax rate based on current balance.
 TAX_BRACKETS = [
@@ -83,6 +91,22 @@ TAX_BRACKETS = [
 ]
 
 FALLBACKS = ["dang same", "yo fr", "ehh idk", "ðŸ˜­"]
+
+from zoneinfo import ZoneInfo
+from datetime import datetime as _datetime
+
+AWST = ZoneInfo("Australia/Perth")  # UTC+8, no DST
+BEDTIME_START_HOUR = 22  # 10pm
+BEDTIME_END_HOUR = 7     # 7am
+bot_is_asleep = False
+sleep_override = None  # None = auto (clock-based), True = forced asleep, False = forced awake
+
+
+def is_bedtime():
+    if sleep_override is not None:
+        return sleep_override
+    hour = _datetime.now(AWST).hour
+    return hour >= BEDTIME_START_HOUR or hour < BEDTIME_END_HOUR
 
 # ================= DEBUG =================
 
@@ -99,6 +123,8 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================= STATE =================
+
+cash_file_lock = asyncio.Lock()
 
 user_pools = {}  # {user_id: [phrases]}
 user_full_lines = {}  # {user_id: [full raw messages]}
@@ -145,6 +171,11 @@ def can_use_assassinate(uid):
       return True, 0
     remaining = get_remaining_cooldown(last_assassinate.get(uid, 0), ASSASSINATE_COOLDOWN)
     return remaining == 0, remaining
+
+
+def get_assassination_protection(target_id):
+    """Seconds remaining before a recently-hit target can be assassinated again."""
+    return get_remaining_cooldown(last_assassinated_at.get(target_id, 0), ASSASSINATE_TIMEOUT_SECONDS)
 def is_valid_phrase(text):
     if text.startswith("!"):
       return False
@@ -165,7 +196,7 @@ def _clean_display_name(name):
     return re.sub(r"^\[\$?\d+\]\s*", "", name)
 
 
-async def update_cash_nick(member, cash):
+async def update_cash_nick(member, cash, force=False):
     if member is None or not isinstance(member, discord.Member):
       return
 
@@ -180,8 +211,18 @@ async def update_cash_nick(member, cash):
     if member.nick == new_nick:
       return
 
+    # Discord rate-limits nickname edits per guild; throttle unless forced
+    # (forced is used for things like admin !setcash / !resetuser where the
+    # user is directly watching for the update).
+    if not force:
+      remaining = get_remaining_cooldown(last_nick_edit.get(member.id, 0), NICK_EDIT_MIN_INTERVAL)
+      if remaining > 0:
+        debug(f"Nick edit throttled for {member.display_name} ({remaining}s left)")
+        return
+
     try:
       await member.edit(nick=new_nick, reason="Cash display update")
+      last_nick_edit[member.id] = int(time.time())
     except discord.Forbidden:
       debug(f"No permission to edit nickname for {member.display_name}")
     except discord.HTTPException:
@@ -212,7 +253,7 @@ def clear_user_state(uid):
     uid = int(uid)
     user_cash[uid] = STARTING_CASH
     user_debt[uid] = 0
-  tax_evasion_debt.pop(uid, None)
+    tax_evasion_debt.pop(uid, None)
     last_beg.pop(uid, None)
     last_work.pop(uid, None)
     last_pray.pop(uid, None)
@@ -220,10 +261,18 @@ def clear_user_state(uid):
     last_debt_penalty.pop(uid, None)
     last_tax.pop(uid, None)
     last_assassinate.pop(uid, None)
+    last_assassinated_at.pop(uid, None)
 
 
 def is_money_admin(uid):
-    return int(uid) == MONEY_ADMIN_USER_ID or int(uid) == 1055064009457537024
+    return int(uid) in ADMIN_USER_IDS
+
+
+def admin_check():
+    """Single reusable permission check for all admin-gated commands."""
+    async def predicate(ctx):
+        return is_money_admin(ctx.author.id)
+    return commands.check(predicate)
 
 
 async def resolve_member_and_amount(ctx, first: str, second: str):
@@ -252,10 +301,10 @@ def get_tax_due(uid):
 
     balance = get_cash(uid)
     rate = tax_rate_for_balance(balance)
-    tax_amount = int(balance * rate)
+    tax_amount = tax_amount_for_balance(balance)
     return tax_amount, rate, 0
 
-async def set_cash(uid, amount, member=None):
+async def set_cash(uid, amount, member=None, force_nick=False):
       uid = int(uid)
       user_cash[uid] = max(0, int(amount))
       
@@ -268,7 +317,7 @@ async def set_cash(uid, amount, member=None):
                   break
 
       if member:
-          await update_cash_nick(member, user_cash[uid])
+          await update_cash_nick(member, user_cash[uid], force=force_nick)
 
       await save_cash_data()
 
@@ -383,12 +432,13 @@ async def save_cash_data():
       "bot_stats": bot_stats,
       "channel_id": CHANNEL_ID,
     }
-    try:
-      async with aiofiles.open(CASH_FILE, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
-    except OSError as exc:
-      debug(f"Failed to save cash data: {exc}")
-      return False
+    async with cash_file_lock:
+      try:
+        async with aiofiles.open(CASH_FILE, "w", encoding="utf-8") as f:
+          await f.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+      except OSError as exc:
+        debug(f"Failed to save cash data: {exc}")
+        return False
 
     return True
 
@@ -427,10 +477,36 @@ def fmt_seconds(seconds):
 
 
 def tax_rate_for_balance(balance):
+    """Marginal (top) rate for display purposes -- e.g. 'you're in the 10% bracket'."""
     for threshold, rate in TAX_BRACKETS:
       if balance >= threshold:
         return rate
     return 0.0
+
+
+def tax_amount_for_balance(balance):
+    """
+    Progressive tax: each bracket's rate only applies to the slice of balance
+    that falls within it, so crossing a threshold can never leave you with
+    less after-tax cash than staying just under it.
+    """
+    if balance <= 0:
+      return 0
+
+    # Brackets are stored highest-threshold-first; walk lowest-first for slicing.
+    ordered = sorted(TAX_BRACKETS, key=lambda pair: pair[0])
+    total_tax = 0.0
+
+    for i, (threshold, rate) in enumerate(ordered):
+      if balance <= threshold:
+        continue
+      upper = ordered[i + 1][0] if i + 1 < len(ordered) else None
+      slice_top = balance if upper is None else min(balance, upper)
+      slice_amount = slice_top - threshold
+      if slice_amount > 0:
+        total_tax += slice_amount * rate
+
+    return int(total_tax)
 
 
 async def apply_tax_if_due(uid, member=None):
@@ -542,6 +618,19 @@ async def get_recent_human_members(channel, max_messages=60):
     return list(members.values())
 
 
+AUTOSAVE_INTERVAL_SECONDS = 300  # 5 minutes
+
+
+async def autosave_loop():
+    """Safety-net save independent of action-triggered saves, in case
+    something throws between a state change and its explicit save call."""
+    await bot.wait_until_ready()
+    while True:
+      await asyncio.sleep(AUTOSAVE_INTERVAL_SECONDS)
+      ok = await save_cash_data()
+      debug(f"Autosave {'ok' if ok else 'FAILED'}")
+
+
 async def bot_economy_loop():
     await bot.wait_until_ready()
     channel = bot.get_channel(CHANNEL_ID)
@@ -552,6 +641,9 @@ async def bot_economy_loop():
 
     while True:
       await asyncio.sleep(random.randint(BOT_AUTO_MIN_DELAY, BOT_AUTO_MAX_DELAY))
+
+      if is_bedtime():
+        continue
 
       if not BOT_AUTO_ECONOMY_ENABLED:
         continue
@@ -805,11 +897,17 @@ async def send_phrase_reply(channel):
     if random.random() < SILENCE_CHANCE:
       debug("Silence roll triggered")
       return
-    # Random chance to use an economy command instead
     if random.random() < 0.25:  # 25% chance
-        possible_commands = ["!beg", "!work", "!pray", "!gamble all", "!steal <@1388459209431187557>"]
-        chosen = random.choice(possible_commands)
+        possible_commands = ["!beg", "!work", "!pray", "!gamble all"]
 
+        # Steal only if there's actually a recent human to target -- pick
+        # from whoever has talked recently instead of a hardcoded user.
+        recent_targets = await get_recent_human_members(channel)
+        if recent_targets:
+          steal_target = random.choice(recent_targets)
+          possible_commands.append(f"!steal {steal_target.mention} all")
+
+        chosen = random.choice(possible_commands)
         debug(f"Bot using command: {chosen}")
         await channel.send(chosen)
         return
@@ -880,6 +978,39 @@ async def send_phrase_reply(channel):
 
 
 @bot.event
+async def on_command_error(ctx, error):
+    if ctx.channel.id != CHANNEL_ID:
+      return
+
+    if isinstance(error, commands.CommandNotFound):
+      return  # ignore unknown "!whatever" chatter, not worth a reply
+
+    if isinstance(error, commands.CheckFailure):
+      await ctx.send("not allowed")
+      return
+
+    if isinstance(error, commands.CommandOnCooldown):
+      await ctx.send(f"that's on cooldown, try again in {fmt_seconds(int(error.retry_after))}")
+      return
+
+    if isinstance(error, commands.MemberNotFound):
+      await ctx.send(f"couldn't find a member matching '{error.argument}'")
+      return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+      await ctx.send(f"missing an argument: {error.param.name}. check the command usage.")
+      return
+
+    if isinstance(error, commands.BadArgument):
+      await ctx.send("that argument doesn't look right, double check the command usage.")
+      return
+
+    # Anything else: log it, don't leave the user hanging on silence.
+    debug(f"Unhandled command error in {ctx.command}: {error!r}")
+    await ctx.send("something went wrong running that command.")
+
+
+@bot.event
 async def on_ready():
     global bot_user_id
     await load_corpus()
@@ -895,13 +1026,32 @@ async def on_ready():
       print(f"Failed to sync commands: {e}")
     bot.loop.create_task(terminal_input_loop())
     bot.loop.create_task(bot_economy_loop())
-
+    bot.loop.create_task(autosave_loop())
 @bot.event
 async def on_message(message):
     global message_counter, messages_per_reply
 
-    if message.author.bot or message.channel.id != CHANNEL_ID:
-      return
+    if message.channel.id != CHANNEL_ID:
+        return
+
+    # ignore other bots, but allow self
+    if message.author.bot and message.author.id != bot.user.id:
+        return
+
+    global bot_is_asleep
+    raw_content_peek = message.content.strip()
+    command_peek = raw_content_peek.split(maxsplit=1)[0].lower() if raw_content_peek else ""
+    if command_peek in {"!sleep", "!wake"}:
+        await bot.process_commands(message)
+        return
+
+    if is_bedtime():
+        if not bot_is_asleep:
+            bot_is_asleep = True
+            await message.channel.send("going to bed, back at 7am")
+        return
+    else:
+        bot_is_asleep = False
 
     raw_content = message.content.strip()
     content = raw_content.lower()
@@ -913,7 +1063,6 @@ async def on_message(message):
     debt_fee, debt_growth, debt_ticks = await apply_debt_penalty_if_due(uid, message.author)
     taxed, rate = (0, 0.0) if skip_auto_tax else await apply_tax_if_due(uid, message.author)
     bot_stats["messages_seen"] += 1
-
     if debt_ticks > 0:
       await message.channel.send(
         f"{message.author.mention} overdue loan penalty x{debt_ticks}: -${debt_fee} cash, +${debt_growth} debt. "
@@ -948,19 +1097,17 @@ async def on_message(message):
         await append_corpus_line(uid, content, is_quote=False)
     else:
       debug("Phrase rejected")
-
     if raw_content and not raw_content.startswith("!"):
-      message_counter += 1
-      debug(f"Message counter: {message_counter}/{messages_per_reply}")
+        message_counter += 1
+        debug(f"Message counter: {message_counter}/{messages_per_reply}")
 
-      if message_counter >= messages_per_reply:
-        message_counter = 0
-        messages_per_reply = random.randint(1, 5)
-        debug(f"Trigger reply, next in {messages_per_reply}")
-        await send_phrase_reply(message.channel)
+        if message_counter >= messages_per_reply:
+            message_counter = 0
+            messages_per_reply = random.randint(1, 5)
+            debug(f"Trigger reply, next in {messages_per_reply}")
+            await send_phrase_reply(message.channel)
 
     await bot.process_commands(message)
-
 
 # ================= COMMANDS =================
 
@@ -993,6 +1140,14 @@ async def assassinate(ctx, member: discord.Member):
           await ctx.send(f"Assassinate is on cooldown. Try again in {fmt_seconds(remaining)}.")
           return
 
+        protection_remaining = get_assassination_protection(target_id)
+        if protection_remaining > 0:
+          await ctx.send(
+            f"{member.mention} was recently hit and is under protection for another "
+            f"{fmt_seconds(protection_remaining)}."
+          )
+          return
+
       attacker_cash = get_cash(attacker_id)
       if not privileged and attacker_cash < ASSASSINATE_COST:
           await ctx.send(f"You need ${ASSASSINATE_COST} to attempt an assassination. Current cash: ${attacker_cash}")
@@ -1007,9 +1162,13 @@ async def assassinate(ctx, member: discord.Member):
           target_cash = get_cash(target_id)
           user_cash[target_id] = 0
           user_debt[target_id] = get_debt(target_id) + 10000
+          last_assassinated_at[target_id] = int(time.time())
           await update_cash_nick(member, 0)
           await save_cash_data()
-          await ctx.send(f"ðŸ’€ Assassination succeeded! {member.mention} loses ${target_cash} and gains $10,000 debt.")
+          await ctx.send(
+            f"ðŸ’€ Assassination succeeded! {member.mention} loses ${target_cash} and gains $10,000 debt. "
+            f"they're protected from further assassinations for {fmt_seconds(ASSASSINATE_TIMEOUT_SECONDS)}."
+          )
       else:
           user_cash[attacker_id] = 0
           user_debt[attacker_id] = get_debt(attacker_id) + 10000
@@ -1034,6 +1193,9 @@ async def reset(ctx):
     last_loan.clear()
     last_debt_penalty.clear()
     last_tax.clear()
+    last_assassinate.clear()
+    last_assassinated_at.clear()
+    last_nick_edit.clear()
     for key in bot_stats.keys():
       bot_stats[key] = 0
     async with aiofiles.open(TEXT_FILE, "w", encoding="utf-8") as f:
@@ -1052,6 +1214,40 @@ async def cash(ctx):
     balance = get_cash(ctx.author.id)
     await update_cash_nick(ctx.author, balance)
     await ctx.send(f"{ctx.author.mention} has ${balance}")
+
+
+LEADERBOARD_SIZE = 10
+
+
+@bot.command(aliases=["rich", "top"])
+async def leaderboard(ctx):
+    if ctx.channel.id != CHANNEL_ID:
+      return
+
+    ranked = sorted(user_cash.items(), key=lambda pair: pair[1], reverse=True)
+    ranked = [(uid, amount) for uid, amount in ranked if uid != bot_user_id]
+
+    if not ranked:
+      await ctx.send("nobody has any cash yet")
+      return
+
+    lines = []
+    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    for i, (uid, amount) in enumerate(ranked[:LEADERBOARD_SIZE]):
+      guild_member = ctx.guild.get_member(uid) if ctx.guild is not None else None
+      name = guild_member.display_name if guild_member is not None else f"user {uid}"
+      name = _clean_display_name(name)
+      rank_marker = medals.get(i, f"{i + 1}.")
+      debt = get_debt(uid)
+      debt_note = f" (debt ${debt})" if debt > 0 else ""
+      lines.append(f"{rank_marker} **{name}** — ${amount}{debt_note}")
+
+    embed = discord.Embed(
+      title="cash leaderboard",
+      description="\n".join(lines),
+      color=discord.Color.gold(),
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -1096,29 +1292,25 @@ async def stats(ctx, member: discord.Member = None):
 
 
 @bot.command()
+@admin_check()
 async def setcash(ctx, member: discord.Member, amount: int):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
-    await set_cash(member.id, amount, member)
+    await set_cash(member.id, amount, member, force_nick=True)
     await ctx.send(f"set {member.mention} cash to ${get_cash(member.id)}")
 
 
 @bot.command()
+@admin_check()
 async def resetuser(ctx, member: discord.Member):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     clear_user_state(member.id)
-    await update_cash_nick(member, STARTING_CASH)
+    await update_cash_nick(member, STARTING_CASH, force=True)
     await save_cash_data()
     await ctx.send(
       f"reset {member.mention}: cash ${STARTING_CASH}, debt $0, and all cooldowns cleared"
@@ -1126,13 +1318,11 @@ async def resetuser(ctx, member: discord.Member):
 
 
 @bot.command()
+@admin_check()
 async def setdebt(ctx, member: discord.Member, amount: int):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     user_debt[member.id] = max(0, int(amount))
     if user_debt[member.id] == 0:
@@ -1144,13 +1334,11 @@ async def setdebt(ctx, member: discord.Member, amount: int):
 
 
 @bot.command()
+@admin_check()
 async def adddebt(ctx, first: str, second: str):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     member, amount = await resolve_member_and_amount(ctx, first, second)
     if member is None or amount is None:
@@ -1168,13 +1356,11 @@ async def adddebt(ctx, first: str, second: str):
 
 
 @bot.command()
+@admin_check()
 async def takedebt(ctx, first: str, second: str):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     member, amount = await resolve_member_and_amount(ctx, first, second)
     if member is None or amount is None:
@@ -1193,53 +1379,51 @@ async def takedebt(ctx, first: str, second: str):
 
 
 @bot.command()
+@admin_check()
 async def setbotcash(ctx, amount: int):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     if bot_user_id is None:
       await ctx.send("bot cash is not ready yet")
       return
 
-    await set_cash(bot_user_id, amount, ctx.guild.get_member(bot_user_id) if ctx.guild is not None else None)
+    await set_cash(
+      bot_user_id, amount,
+      ctx.guild.get_member(bot_user_id) if ctx.guild is not None else None,
+      force_nick=True,
+    )
     await ctx.send(f"set bot cash to ${get_bot_cash()}")
 
 
 @bot.command()
+@admin_check()
 async def addcash(ctx, member: discord.Member, amount: int):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     if amount <= 0:
       await ctx.send("amount must be more than 0")
       return
 
-    await set_cash(member.id, get_cash(member.id) + amount, member)
+    await set_cash(member.id, get_cash(member.id) + amount, member, force_nick=True)
     await ctx.send(f"added ${amount} to {member.mention}. new cash: ${get_cash(member.id)}")
 
 
 @bot.command()
+@admin_check()
 async def takecash(ctx, member: discord.Member, amount: int):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     if amount <= 0:
       await ctx.send("amount must be more than 0")
       return
 
-    await set_cash(member.id, get_cash(member.id) - amount, member)
+    await set_cash(member.id, get_cash(member.id) - amount, member, force_nick=True)
     await ctx.send(f"took ${amount} from {member.mention}. new cash: ${get_cash(member.id)}")
 
 
@@ -1740,23 +1924,21 @@ async def quotes(ctx, member: discord.Member = None, page: int = 1):
     await ctx.send(embed=embed)
 
 @bot.command()
-async def ping(ctx):
+@admin_check()
+async def ping(ctx, member: discord.Member = None):
       if ctx.channel.id != CHANNEL_ID:
           return
 
-      user_id = 1162994221280669738
-
+      target = member or ctx.author
       for i in range(20):  # number of pings
-          await ctx.send(f"<@{user_id}>")
+          await ctx.send(f"{target.mention}")
           await asyncio.sleep(0.8)  # delay so Discord doesnâ€™t slap your bot
 @bot.command()
+@admin_check()
 async def forcetaxall(ctx):
     if ctx.channel.id != CHANNEL_ID:
       return
 
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     total_collected = 0
     users_taxed = 0
@@ -1773,11 +1955,9 @@ async def forcetaxall(ctx):
 
 
 @bot.command()
+@admin_check()
 async def setup(ctx, channel_id: int = None):
     global CHANNEL_ID
-    if not is_money_admin(ctx.author.id):
-      await ctx.send("not allowed")
-      return
 
     if channel_id is None:
       await ctx.send(f"current channel: {CHANNEL_ID}. usage: !setup <channel_id>")
@@ -1791,6 +1971,35 @@ async def setup(ctx, channel_id: int = None):
       await ctx.send(f"error setting channel: {e}")
 
 
+@bot.command(name="sleep")
+@admin_check()
+async def sleep_cmd(ctx):
+    if ctx.channel.id != CHANNEL_ID:
+      return
+
+
+    global sleep_override, bot_is_asleep
+    sleep_override = True
+    if not bot_is_asleep:
+      bot_is_asleep = True
+      await ctx.send("going to bed, back at 7am")
+    else:
+      await ctx.send("already asleep")
+
+
+@bot.command(name="wake")
+@admin_check()
+async def wake_cmd(ctx):
+    if ctx.channel.id != CHANNEL_ID:
+      return
+
+
+    global sleep_override, bot_is_asleep
+    sleep_override = None
+    bot_is_asleep = False
+    await ctx.send("morning, i'm awake")
+
+
 @bot.command(name="global")
 async def global_mode(ctx):
     global mode, track_target
@@ -1801,7 +2010,7 @@ async def global_mode(ctx):
 
 
 @bot.command()
-@commands.is_owner()
+@admin_check()
 async def imitate(ctx, member: discord.Member):
     global mode, track_target
     mode = "track"
@@ -1823,4 +2032,3 @@ if __name__ == "__main__":
     if not TOKEN:
       raise ValueError("No token found. Make sure DISCORD_TOKEN or TOKEN is set in your environment variables.")
     bot.run(TOKEN)
-
