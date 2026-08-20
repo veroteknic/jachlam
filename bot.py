@@ -2,11 +2,13 @@ import asyncio
 import discord
 from discord.ext import commands
 import aiofiles
+import aiohttp
 import random
 import os
 import json
 import re
 import time
+from datetime import timedelta
 from collections import deque
 from dotenv import load_dotenv
 # Load environment variables
@@ -80,6 +82,17 @@ NICK_EDIT_MIN_INTERVAL = 20
 last_nick_edit = {}  # {member_id: unix_ts}
 
 ADMIN_USER_IDS = {MONEY_ADMIN_USER_ID}
+
+# --- gif-repeat auto-timeout ---
+# Set to the real user id this should apply to; leave as None to disable.
+ORION_USER_ID = 1388459209431187557
+GIF_REPEAT_TIMEOUT_DAYS = 7
+seen_gif_keys = set()  # normalized identifiers for gifs/images already posted
+
+# --- channel nuke ---
+NUKE_TIMEOUT_DAYS = 7
+NUKE_CONFIRM_WINDOW = 20  # seconds to confirm before the nuke expires
+pending_nukes = {}  # {channel_id: admin_user_id}
 
 # Progressive tax rate based on current balance.
 TAX_BRACKETS = [
@@ -1027,6 +1040,61 @@ async def on_ready():
     bot.loop.create_task(terminal_input_loop())
     bot.loop.create_task(bot_economy_loop())
     bot.loop.create_task(autosave_loop())
+GIF_URL_PATTERN = re.compile(
+    r"(https?://\S+\.(?:gif|gifv)\S*|https?://(?:media\.)?tenor\.com/\S+|https?://(?:media\.)?giphy\.com/\S+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_gif_keys(message):
+    keys = []
+    for attachment in message.attachments:
+      name = (attachment.filename or "").lower()
+      if name.endswith((".gif", ".gifv", ".webp", ".mp4")) or "gif" in (attachment.content_type or ""):
+        keys.append(f"attach:{attachment.filename}:{attachment.size}")
+
+    for match in GIF_URL_PATTERN.findall(message.content or ""):
+      keys.append(f"url:{match.strip().split('?')[0].rstrip('/')}")
+
+    return keys
+
+
+async def check_gif_repeat(message):
+    """If the configured user reposts a gif that's already been seen in the
+    channel, timeout them for GIF_REPEAT_TIMEOUT_DAYS. Native Discord timeout
+    (reversible, capped at 28 days) rather than a ban -- this is a joke
+    feature and shouldn't permanently remove anyone over a false positive."""
+    if ORION_USER_ID is None:
+      return
+
+    keys = _extract_gif_keys(message)
+    if not keys:
+      return
+
+    if message.author.id != ORION_USER_ID:
+      # still record these gifs as "seen" so a repeat by Orion later is caught
+      seen_gif_keys.update(keys)
+      return
+
+    repeats = [k for k in keys if k in seen_gif_keys]
+    seen_gif_keys.update(keys)
+
+    if not repeats:
+      return
+
+    member = message.author
+    if not isinstance(member, discord.Member):
+      return
+
+    try:
+      await member.timeout(timedelta(days=GIF_REPEAT_TIMEOUT_DAYS), reason="Reposted a gif that's already been used")
+      await message.channel.send(
+        f"{member.mention} reposted a gif that's already been used. timed out for {GIF_REPEAT_TIMEOUT_DAYS} days."
+      )
+    except discord.HTTPException as exc:
+      debug(f"Failed to timeout {member.display_name} for gif repeat: {exc}")
+
+
 @bot.event
 async def on_message(message):
     global message_counter, messages_per_reply
@@ -1052,6 +1120,8 @@ async def on_message(message):
         return
     else:
         bot_is_asleep = False
+
+    await check_gif_repeat(message)
 
     raw_content = message.content.strip()
     content = raw_content.lower()
@@ -1214,6 +1284,94 @@ async def cash(ctx):
     balance = get_cash(ctx.author.id)
     await update_cash_nick(ctx.author, balance)
     await ctx.send(f"{ctx.author.mention} has ${balance}")
+
+
+@bot.command(aliases=["yn"])
+async def yesorno(ctx, name: str, *, question: str = ""):
+    if ctx.channel.id != CHANNEL_ID:
+      return
+
+    answer = random.choice(["yes", "no"])
+    await ctx.send(f"{name.capitalize()}: {answer}")
+
+
+@bot.command(name="image", aliases=["gif", "img"])
+async def random_image(ctx):
+    if ctx.channel.id != CHANNEL_ID:
+      return
+
+    try:
+      async with aiohttp.ClientSession() as session:
+        async with session.get("https://meme-api.com/gimme", timeout=10) as resp:
+          if resp.status != 200:
+            await ctx.send("couldn't fetch an image right now, try again in a bit")
+            return
+          data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+      await ctx.send("couldn't fetch an image right now, try again in a bit")
+      return
+
+    url = data.get("url")
+    if not url:
+      await ctx.send("couldn't fetch an image right now, try again in a bit")
+      return
+
+    await ctx.send(url)
+
+
+@bot.command()
+@admin_check()
+async def nuke(ctx, confirm: str = None):
+    """Admin-only: purges the channel and times out everyone who posted in it."""
+    if ctx.channel.id != CHANNEL_ID:
+      return
+
+    channel = ctx.channel
+
+    if confirm != "confirm":
+      pending_nukes[channel.id] = ctx.author.id
+      await ctx.send(
+        f"⚠️ this will delete recent messages in this channel and timeout every "
+        f"non-admin who posted here for {NUKE_TIMEOUT_DAYS} days. "
+        f"run `!nuke confirm` within {NUKE_CONFIRM_WINDOW}s to go through with it."
+      )
+
+      async def expire_pending():
+        await asyncio.sleep(NUKE_CONFIRM_WINDOW)
+        pending_nukes.pop(channel.id, None)
+
+      bot.loop.create_task(expire_pending())
+      return
+
+    if pending_nukes.get(channel.id) != ctx.author.id:
+      await ctx.send("no pending nuke to confirm -- run `!nuke` first.")
+      return
+
+    pending_nukes.pop(channel.id, None)
+
+    recent_authors = await get_recent_human_members(channel, max_messages=200)
+
+    deleted = 0
+    try:
+      deleted_msgs = await channel.purge(limit=200)
+      deleted = len(deleted_msgs)
+    except discord.HTTPException as exc:
+      debug(f"Nuke purge failed: {exc}")
+
+    timed_out = []
+    for member in recent_authors:
+      if is_money_admin(member.id):
+        continue
+      try:
+        await member.timeout(timedelta(days=NUKE_TIMEOUT_DAYS), reason="Channel nuke")
+        timed_out.append(member.display_name)
+      except discord.HTTPException as exc:
+        debug(f"Failed to timeout {member.display_name}: {exc}")
+
+    summary = f"💥 nuked. {deleted} messages deleted."
+    if timed_out:
+      summary += f" timed out for {NUKE_TIMEOUT_DAYS} days: {', '.join(timed_out)}."
+    await channel.send(summary)
 
 
 LEADERBOARD_SIZE = 10
@@ -1982,7 +2140,16 @@ async def sleep_cmd(ctx):
     sleep_override = True
     if not bot_is_asleep:
       bot_is_asleep = True
-      await ctx.send("going to bed, back at 7am")
+      if is_bedtime():
+        await ctx.send("going to bed, back at 7am")
+      else:
+        await ctx.send(
+          random.choice([
+            "aww, do i have to? fine... going to bed early i guess :(",
+            "but it's not even bedtime yet... okay, going to sleep i guess.",
+            "no fair, i'm not even tired. night i guess.",
+          ])
+        )
     else:
       await ctx.send("already asleep")
 
