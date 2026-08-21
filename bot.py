@@ -103,7 +103,7 @@ TAX_BRACKETS = [
     (0, 0.00),
 ]
 
-FALLBACKS = ["dang same", "yo fr", "ehh idk", "ðŸ˜­"]
+FALLBACKS = ["dang same", "yo fr", "ehh idk", "\U0001f62d"]
 
 from zoneinfo import ZoneInfo
 from datetime import datetime as _datetime
@@ -133,6 +133,7 @@ def debug(msg):
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================= STATE =================
@@ -690,20 +691,24 @@ async def bot_economy_loop():
 
       action = random.choice(available_actions)
 
+      # NOTE: these flavor lines intentionally do NOT start with "!" -- the
+      # bot's own messages still get run through bot.process_commands()
+      # (see on_message), so a literal "!beg" here would trigger the real
+      # !beg command a second time on top of the manual set_cash() below,
+      # double-paying the bot and spamming a bogus cooldown reply.
+
       if action == "beg":
         reward = random.randint(BEG_MIN, BEG_MAX)
         last_beg[bot_user_id] = int(time.time())
-        await channel.send("!beg")
         await set_cash(bot_user_id, get_bot_cash() + reward, bot_member)
-        await channel.send(f"bot used !beg and got ${reward}. bot cash: ${get_bot_cash()}")
+        await channel.send(f"*begs for change* got ${reward}. bot cash: ${get_bot_cash()}")
         continue
 
       if action == "work":
         reward = random.randint(WORK_MIN, WORK_MAX)
         last_work[bot_user_id] = int(time.time())
-        await channel.send("!work")
         await set_cash(bot_user_id, get_bot_cash() + reward, bot_member)
-        await channel.send(f"bot used !work and earned ${reward}. bot cash: ${get_bot_cash()}")
+        await channel.send(f"*works a shift* earned ${reward}. bot cash: ${get_bot_cash()}")
         continue
 
       if action == "give":
@@ -719,7 +724,6 @@ async def bot_economy_loop():
         if give_amount <= 0:
           continue
 
-        await channel.send(f"!give {target.mention} {give_amount}")
         target_balance = get_cash(target.id)
         await set_cash(bot_user_id, balance - give_amount, bot_member)
         await set_cash(target.id, target_balance + give_amount, target if isinstance(target, discord.Member) else None)
@@ -745,7 +749,6 @@ async def bot_economy_loop():
         if steal_amount <= 0:
           continue
 
-        await channel.send(f"!steal {target.mention} {steal_amount}")
         success = random.random() < STEAL_SUCCESS_CHANCE
 
         if success:
@@ -785,7 +788,6 @@ async def bot_economy_loop():
       if bet <= 0:
         continue
 
-      await channel.send(f"!gamble {bet}")
       won = random.random() < GAMBLE_WIN_CHANCE
       new_balance = balance + bet if won else balance - bet
       await set_cash(bot_user_id, new_balance, bot_member)
@@ -793,11 +795,11 @@ async def bot_economy_loop():
       if won:
         bot_stats["gamble_wins"] += 1
         await save_cash_data()
-        await channel.send(f"bot won ${bet}. bot cash: ${new_balance}")
+        await channel.send(f"bot gambled ${bet} and won. bot cash: ${new_balance}")
       else:
         bot_stats["gamble_losses"] += 1
         await save_cash_data()
-        await channel.send(f"bot lost ${bet}. bot cash: ${new_balance}")
+        await channel.send(f"bot gambled ${bet} and lost. bot cash: ${new_balance}")
 
 def learn_reactions(text):
     words = text.split()
@@ -1106,6 +1108,16 @@ async def on_message(message):
     if message.author.bot and message.author.id != bot.user.id:
         return
 
+    # The bot's own messages still need to go through bot.process_commands()
+    # below (some flavor replies from send_phrase_reply are literal command
+    # strings like "!gamble all" that are meant to actually fire). But they
+    # must NOT be treated as user chatter: no tax/debt processing on them,
+    # no corpus learning from the bot's own output (that would be a feedback
+    # loop -- the bot slowly starts imitating itself), and no counting
+    # towards message_counter (which would let the bot's own messages
+    # re-trigger send_phrase_reply and cascade).
+    is_self_message = message.author.id == bot.user.id
+
     global bot_is_asleep
     raw_content_peek = message.content.strip()
     command_peek = raw_content_peek.split(maxsplit=1)[0].lower() if raw_content_peek else ""
@@ -1121,7 +1133,8 @@ async def on_message(message):
     else:
         bot_is_asleep = False
 
-    await check_gif_repeat(message)
+    if not is_self_message:
+      await check_gif_repeat(message)
 
     raw_content = message.content.strip()
     content = raw_content.lower()
@@ -1129,53 +1142,56 @@ async def on_message(message):
     command_name = raw_content.split(maxsplit=1)[0].lower() if raw_content else ""
     skip_auto_tax = command_name in {"!evade", "!taxevade"}
 
-    get_cash(uid)
-    debt_fee, debt_growth, debt_ticks = await apply_debt_penalty_if_due(uid, message.author)
-    taxed, rate = (0, 0.0) if skip_auto_tax else await apply_tax_if_due(uid, message.author)
-    bot_stats["messages_seen"] += 1
-    if debt_ticks > 0:
-      await message.channel.send(
-        f"{message.author.mention} overdue loan penalty x{debt_ticks}: -${debt_fee} cash, +${debt_growth} debt. "
-        f"cash: ${get_cash(uid)} | debt: ${get_debt(uid)}"
-      )
+    if not is_self_message:
+      get_cash(uid)
+      debt_fee, debt_growth, debt_ticks = await apply_debt_penalty_if_due(uid, message.author)
+      taxed, rate = (0, 0.0) if skip_auto_tax else await apply_tax_if_due(uid, message.author)
+      bot_stats["messages_seen"] += 1
+      if debt_ticks > 0:
+        await message.channel.send(
+          f"{message.author.mention} overdue loan penalty x{debt_ticks}: -${debt_fee} cash, +${debt_growth} debt. "
+          f"cash: ${get_cash(uid)} | debt: ${get_debt(uid)}"
+        )
 
-    if taxed > 0:
-      if bot_user_id is not None:
-        await set_cash(bot_user_id, get_bot_cash() + taxed)
-        bot_stats["tax_collected"] += taxed
-      await message.channel.send(
-        f"{message.author.mention} paid ${taxed} tax ({int(rate * 100)}%). new balance: ${get_cash(uid)}"
-      )
+      if taxed > 0:
+        if bot_user_id is not None:
+          await set_cash(bot_user_id, get_bot_cash() + taxed)
+          bot_stats["tax_collected"] += taxed
+        await message.channel.send(
+          f"{message.author.mention} paid ${taxed} tax ({int(rate * 100)}%). new balance: ${get_cash(uid)}"
+        )
 
     debug(f"Message from {message.author.display_name}: {content}")
     debug(f"Mode: {mode}")
 
-    if mode == "track" and uid == track_target and raw_content and not raw_content.startswith("!"):
-      user_full_lines.setdefault(uid, []).append(raw_content)
-      if len(user_full_lines[uid]) > MAX_TRACK_LINES:
-        user_full_lines[uid].pop(0)
+    if not is_self_message:
+      if mode == "track" and uid == track_target and raw_content and not raw_content.startswith("!"):
+        user_full_lines.setdefault(uid, []).append(raw_content)
+        if len(user_full_lines[uid]) > MAX_TRACK_LINES:
+          user_full_lines[uid].pop(0)
 
-    if is_valid_phrase(content):
-      debug("Phrase accepted")
-      learn_reactions(content)
+      if is_valid_phrase(content):
+        debug("Phrase accepted")
+        learn_reactions(content)
 
-      if mode == "global" or (mode == "track" and uid == track_target):
-        user_pools.setdefault(uid, []).append(content)
-        if len(user_pools[uid]) > MAX_PHRASES:
-          user_pools[uid].pop(0)
+        if mode == "global" or (mode == "track" and uid == track_target):
+          user_pools.setdefault(uid, []).append(content)
+          if len(user_pools[uid]) > MAX_PHRASES:
+            user_pools[uid].pop(0)
 
-        await append_corpus_line(uid, content, is_quote=False)
-    else:
-      debug("Phrase rejected")
-    if raw_content and not raw_content.startswith("!"):
-        message_counter += 1
-        debug(f"Message counter: {message_counter}/{messages_per_reply}")
+          await append_corpus_line(uid, content, is_quote=False)
+      else:
+        debug("Phrase rejected")
 
-        if message_counter >= messages_per_reply:
-            message_counter = 0
-            messages_per_reply = random.randint(1, 5)
-            debug(f"Trigger reply, next in {messages_per_reply}")
-            await send_phrase_reply(message.channel)
+      if raw_content and not raw_content.startswith("!"):
+          message_counter += 1
+          debug(f"Message counter: {message_counter}/{messages_per_reply}")
+
+          if message_counter >= messages_per_reply:
+              message_counter = 0
+              messages_per_reply = random.randint(1, 5)
+              debug(f"Trigger reply, next in {messages_per_reply}")
+              await send_phrase_reply(message.channel)
 
     await bot.process_commands(message)
 
@@ -1236,7 +1252,7 @@ async def assassinate(ctx, member: discord.Member):
           await update_cash_nick(member, 0)
           await save_cash_data()
           await ctx.send(
-            f"ðŸ’€ Assassination succeeded! {member.mention} loses ${target_cash} and gains $10,000 debt. "
+            f"\U0001f480 Assassination succeeded! {member.mention} loses ${target_cash} and gains $10,000 debt. "
             f"they're protected from further assassinations for {fmt_seconds(ASSASSINATE_TIMEOUT_SECONDS)}."
           )
       else:
@@ -1244,9 +1260,10 @@ async def assassinate(ctx, member: discord.Member):
           user_debt[attacker_id] = get_debt(attacker_id) + 10000
           await update_cash_nick(ctx.author, 0)
           await save_cash_data()
-          await ctx.send(f"âŒ Assassination failed! {ctx.author.mention} loses all cash and gains $10,000 debt.")
+          await ctx.send(f"\u274c Assassination failed! {ctx.author.mention} loses all cash and gains $10,000 debt.")
 
 @bot.command()
+@admin_check()
 async def reset(ctx):
     if ctx.channel.id != CHANNEL_ID:
       return
@@ -1331,7 +1348,7 @@ async def nuke(ctx, confirm: str = None):
     if confirm != "confirm":
       pending_nukes[channel.id] = ctx.author.id
       await ctx.send(
-        f"⚠️ this will delete recent messages in this channel and timeout every "
+        f"\u26a0\ufe0f this will delete recent messages in this channel and timeout every "
         f"non-admin who posted here for {NUKE_TIMEOUT_DAYS} days. "
         f"run `!nuke confirm` within {NUKE_CONFIRM_WINDOW}s to go through with it."
       )
@@ -1368,7 +1385,7 @@ async def nuke(ctx, confirm: str = None):
       except discord.HTTPException as exc:
         debug(f"Failed to timeout {member.display_name}: {exc}")
 
-    summary = f"💥 nuked. {deleted} messages deleted."
+    summary = f"\U0001f4a5 nuked. {deleted} messages deleted."
     if timed_out:
       summary += f" timed out for {NUKE_TIMEOUT_DAYS} days: {', '.join(timed_out)}."
     await channel.send(summary)
@@ -1390,7 +1407,7 @@ async def leaderboard(ctx):
       return
 
     lines = []
-    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    medals = {0: "\U0001f947", 1: "\U0001f948", 2: "\U0001f949"}
     for i, (uid, amount) in enumerate(ranked[:LEADERBOARD_SIZE]):
       guild_member = ctx.guild.get_member(uid) if ctx.guild is not None else None
       name = guild_member.display_name if guild_member is not None else f"user {uid}"
@@ -1398,7 +1415,7 @@ async def leaderboard(ctx):
       rank_marker = medals.get(i, f"{i + 1}.")
       debt = get_debt(uid)
       debt_note = f" (debt ${debt})" if debt > 0 else ""
-      lines.append(f"{rank_marker} **{name}** — ${amount}{debt_note}")
+      lines.append(f"{rank_marker} **{name}** \u2014 ${amount}{debt_note}")
 
     embed = discord.Embed(
       title="cash leaderboard",
@@ -2032,9 +2049,28 @@ async def quotereply(ctx):
 
 
 @bot.command()
-async def quotes(ctx, member: discord.Member = None, page: int = 1):
+async def quotes(ctx, *args):
     if ctx.channel.id != CHANNEL_ID:
       return
+
+    # Accept: !quotes | !quotes @member | !quotes 2 | !quotes @member 2
+    # (order-independent so "!quotes 2" works without having to name someone
+    # just to view page 2 of the global quote list).
+    member = None
+    page = 1
+    converter = commands.MemberConverter()
+
+    for arg in args:
+      try:
+        page = int(arg)
+        continue
+      except ValueError:
+        pass
+      try:
+        member = await converter.convert(ctx, arg)
+      except commands.BadArgument:
+        await ctx.send(f"couldn't find a member or page number matching '{arg}'")
+        return
 
     page = max(1, page)
 
@@ -2078,7 +2114,7 @@ async def quotes(ctx, member: discord.Member = None, page: int = 1):
       description="\n".join(lines),
       color=discord.Color.blue(),
     )
-    embed.set_footer(text=f"page {page}/{total_pages} â€¢ total quotes: {len(entries)}")
+    embed.set_footer(text=f"page {page}/{total_pages} \u2022 total quotes: {len(entries)}")
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -2090,7 +2126,7 @@ async def ping(ctx, member: discord.Member = None):
       target = member or ctx.author
       for i in range(20):  # number of pings
           await ctx.send(f"{target.mention}")
-          await asyncio.sleep(0.8)  # delay so Discord doesnâ€™t slap your bot
+          await asyncio.sleep(0.8)  # delay so Discord doesn't slap your bot
 @bot.command()
 @admin_check()
 async def forcetaxall(ctx):
