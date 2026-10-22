@@ -1,7 +1,43 @@
+# Secrets
 .env
+
+# Python build / runtime artifacts
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+.cache/
+.local/
+*.egg-info/
 .idea/
 .vscode/
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+
+# Runtime state: holds real Discord user IDs and live economy data.
+# In Docker this lives in the jachlam-data volume, not the repo.
+cash_data.json
+cash_data.json.bak
+inventory_data.json
+inventory_data.json.bak
+markov_corpus.txt
+markov_corpus.txt.bak
+seen_gifs.json
+seen_gifs.json.bak
+voicecast_data.json
+voicecast_data.json.bak
+voicecast_episode*.json
+death_data.json
+epstein_data.json
+silence_data.json
+*.bak
+*.tmp
+
+# Historical restore points (live data wins via the Docker volume)
+backups/
+backups.host-old/
+live-backup-*
+live-final-*
+pre-deploy-*

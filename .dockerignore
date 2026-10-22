@@ -1,0 +1,14 @@
+# Keep the build context small. The data files themselves must stay in the
+# context, because a fresh volume is seeded from the image.
+.git
+.cache
+.local
+.venv
+__pycache__/
+*.py[cod]
+backups/
+backups.host-old/
+live-backup-*
+live-final-*
+pre-deploy-*
+*.tmp
